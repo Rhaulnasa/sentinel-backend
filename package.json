@@ -1,0 +1,9 @@
+{
+  "name": "sentinel-backend",
+  "version": "1.0.0",
+  "description": "Sentinel AI Terminal — Backend API proxy",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  }
+}
