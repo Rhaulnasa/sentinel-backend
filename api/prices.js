@@ -1,79 +1,99 @@
+// Twelve Data free tier: 800 req/day, no credit card
+// Sign up at: https://twelvedata.com/register
+// Get API key from: https://twelvedata.com/account/api-keys
+// Set env var TWELVE_DATA_KEY in Vercel dashboard
+
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
+  if (req.method === 'OPTIONS') return res.status(200).end();
 
   const symbols = (req.query.symbols || '').toUpperCase().replace(/[^A-Z,]/g, '');
-  if (!symbols) {
-    return res.status(200).json({ ok: false, error: 'No symbols provided', prices: {} });
-  }
+  if (!symbols) return res.status(200).json({ ok: false, error: 'No symbols', prices: {} });
 
+  const symList = [...new Set(symbols.split(',').filter(Boolean))];
   const prices = {};
+  const TWELVE_KEY = process.env.TWELVE_DATA_KEY;
 
-  try {
-    // Yahoo Finance v8 spark — real-time
-    const url = `https://query1.finance.yahoo.com/v8/finance/spark?symbols=${encodeURIComponent(symbols)}&range=1d&interval=1m&_=${Date.now()}`;
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'application/json',
-      },
-      signal: AbortSignal.timeout(8000),
-    });
-
-    if (response.ok) {
-      const data = await response.json();
-      if (data?.spark?.result) {
-        data.spark.result.forEach(item => {
-          if (!item?.symbol) return;
-          const resp = item.response?.[0];
-          if (!resp) return;
-          const meta = resp.meta || {};
-          if (meta.regularMarketPrice) {
-            prices[item.symbol] = {
-              price: meta.regularMarketPrice,
-              chg: meta.regularMarketChangePercent || 0,
-              vol: meta.regularMarketVolume || 0,
-              avgVol: meta.averageDailyVolume3Month || 0,
-              src: 'YF-spark',
-            };
-          }
-        });
-      }
-    }
-  } catch (e) {}
-
-  // Fallback: Yahoo Finance v7 quote for any missing symbols
-  const missing = symbols.split(',').filter(s => s && !prices[s]);
-  if (missing.length) {
+  // METHOD 1: Twelve Data (free, no IP blocking, works from Vercel)
+  if (TWELVE_KEY) {
     try {
-      const url2 = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(missing.join(','))}&fields=regularMarketPrice,regularMarketChangePercent,regularMarketVolume,averageDailyVolume3Month&_=${Date.now()}`;
-      const response2 = await fetch(url2, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          'Accept': 'application/json',
-        },
-        signal: AbortSignal.timeout(8000),
-      });
-      if (response2.ok) {
-        const data2 = await response2.json();
-        if (data2?.quoteResponse?.result) {
-          data2.quoteResponse.result.forEach(q => {
-            if (q.regularMarketPrice) {
-              prices[q.symbol] = {
-                price: q.regularMarketPrice,
-                chg: q.regularMarketChangePercent || 0,
-                vol: q.regularMarketVolume || 0,
-                avgVol: q.averageDailyVolume3Month || 0,
-                src: 'YF-v7',
-              };
+      const batch = symList.slice(0, 120).join(','); // free tier supports batch
+      const r = await fetch(
+        `https://api.twelvedata.com/price?symbol=${encodeURIComponent(batch)}&apikey=${TWELVE_KEY}`,
+        { signal: AbortSignal.timeout(8000) }
+      );
+      if (r.ok) {
+        const d = await r.json();
+        // If single symbol returns {price: "123.45"}
+        // If multiple returns {AAPL: {price: "123.45"}, MSFT: {price: "456.78"}}
+        if (d.price && symList.length === 1) {
+          prices[symList[0]] = { price: parseFloat(d.price), chg: 0, vol: 0, avgVol: 0, src: 'TD' };
+        } else {
+          Object.entries(d).forEach(([sym, val]) => {
+            if (val?.price && !val?.code) {
+              prices[sym] = { price: parseFloat(val.price), chg: 0, vol: 0, avgVol: 0, src: 'TD' };
             }
           });
         }
+      }
+    } catch (e) {}
+
+    // Get change % for loaded symbols using quote endpoint
+    const loaded = Object.keys(prices);
+    if (loaded.length) {
+      try {
+        const r2 = await fetch(
+          `https://api.twelvedata.com/quote?symbol=${encodeURIComponent(loaded.slice(0,8).join(','))}&apikey=${TWELVE_KEY}`,
+          { signal: AbortSignal.timeout(8000) }
+        );
+        if (r2.ok) {
+          const d2 = await r2.json();
+          const processQuote = (sym, q) => {
+            if (q && q.close && prices[sym]) {
+              prices[sym].chg = parseFloat(q.percent_change || 0);
+              prices[sym].vol = parseInt(q.volume || 0);
+              prices[sym].price = parseFloat(q.close);
+            }
+          };
+          if (d2.symbol) {
+            processQuote(d2.symbol, d2);
+          } else {
+            Object.entries(d2).forEach(([sym, q]) => processQuote(sym, q));
+          }
+        }
+      } catch (e) {}
+    }
+  }
+
+  // METHOD 2: Yahoo Finance fallback (works ~50% of time from Vercel)
+  const missing = symList.filter(s => !prices[s]);
+  if (missing.length) {
+    try {
+      const r = await fetch(
+        `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(missing.slice(0,10).join(','))}&fields=regularMarketPrice,regularMarketChangePercent,regularMarketVolume,averageDailyVolume3Month`,
+        {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+            'Accept': 'application/json',
+          },
+          signal: AbortSignal.timeout(6000),
+        }
+      );
+      if (r.ok) {
+        const d = await r.json();
+        (d?.quoteResponse?.result || []).forEach(q => {
+          if (q.regularMarketPrice) {
+            prices[q.symbol] = {
+              price: Math.round(q.regularMarketPrice * 100) / 100,
+              chg: Math.round((q.regularMarketChangePercent || 0) * 100) / 100,
+              vol: q.regularMarketVolume || 0,
+              avgVol: q.averageDailyVolume3Month || 0,
+              src: 'YF',
+            };
+          }
+        });
       }
     } catch (e) {}
   }
